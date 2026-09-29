@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ripgrep (search tests run on both engines)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ripgrep
+      - name: Set up uv and Python
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - name: Sync frozen dependencies
+        run: uv sync --frozen
+      - name: Lint
+        run: uv run --frozen ruff check src tests scripts
+      - name: Test (traversal, ACL, revisions, locking, auth)
+        run: uv run --frozen pytest
+
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+      - name: Build the image
+        run: docker buildx build --load --tag obsidian-mcp-lite:ci --build-arg BUILD_COMMIT=${{ github.sha }} .
+      - name: "Smoke: auth, Host check, tools/list, denied read, allowed write"
+        env:
+          SMOKE_WRITER_TOKEN: ci-writer-token-0123456789abcdef0123456789
+          SMOKE_READER_TOKEN: ci-reader-token-0123456789abcdef0123456789
+        run: |
+          set -euo pipefail
+          root="$(mktemp -d)"
+          mkdir -p "$root/vault/Private" "$root/vault/Projects" "$root/data"
+          echo "secret" > "$root/vault/Private/secret.md"
+          echo "plan" > "$root/vault/Projects/plan.md"
+          trap 'docker rm -f obsidian-ci >/dev/null 2>&1 || true' EXIT
+          # Run as the runner's uid, like TrueNAS runs it as 568: the image must not assume its own user.
+          docker run -d --name obsidian-ci \
+            --user "$(id -u):$(id -g)" \
+            --read-only --tmpfs /tmp \
+            --security-opt no-new-privileges:true \
+            -p 127.0.0.1:18000:8000 \
+            -e SMOKE_WRITER_TOKEN -e SMOKE_READER_TOKEN \
+            -v "$root/vault:/vault" \
+            -v "$PWD/deploy/ci-acl.yaml:/config/acl.yaml:ro" \
+            -v "$root/data:/data" \
+            obsidian-mcp-lite:ci
+          python3 scripts/smoke.py --url http://127.0.0.1:18000 || { docker logs obsidian-ci; exit 1; }
+          test -s "$root/data/audit.jsonl"
+          docker exec obsidian-ci rg --version | head -1
+          for _ in $(seq 1 20); do
+            s="$(docker inspect -f '{{.State.Health.Status}}' obsidian-ci)"
+            [ "$s" = healthy ] && break
+            sleep 2
+          done
+          echo "health: $s"

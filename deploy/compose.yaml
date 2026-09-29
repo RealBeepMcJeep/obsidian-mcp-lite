@@ -1,0 +1,62 @@
+# obsidian-mcp-lite: service block for the `mcp-servers` Dockge stack.
+#
+# Image (GitHub Actions → GHCR, public):
+#   ghcr.io/realbeepmcjeep/obsidian-mcp-lite:latest        (rolling)
+#   ghcr.io/realbeepmcjeep/obsidian-mcp-lite:sha-<commit>  (immutable, for rollback)
+#
+# Internal only: `mcp_backend` network, NO published ports. MCPHub is the only
+# client; register one upstream per agent at http://obsidian-mcp-lite:8000/mcp
+# with header `Authorization: Bearer <that agent's token>`.
+#
+# Before first start (as root on TrueNAS):
+#   mkdir -p /mnt/tank3/apps/obsidian-mcp/config /mnt/tank3/apps/obsidian-mcp/data
+#   cp acl.example.yaml /mnt/tank3/apps/obsidian-mcp/config/acl.yaml   # then edit it
+#   chown -R 568:568 /mnt/tank3/apps/obsidian-mcp
+# and add the OBSIDIAN_MCP_TOKEN_* values to the stack .env (see .env.example).
+#
+# Reload acl.yaml without a restart: edit the file (picked up within ~1 s) or
+#   docker kill -s HUP obsidian-mcp-lite
+services:
+  obsidian-mcp-lite:
+    image: ghcr.io/realbeepmcjeep/obsidian-mcp-lite:latest
+    pull_policy: always
+    container_name: obsidian-mcp-lite
+    restart: unless-stopped
+    init: true
+    user: "568:568"
+    environment:
+      OBSIDIAN_MCP_TOKEN_CLAUDE: ${OBSIDIAN_MCP_TOKEN_CLAUDE:?set OBSIDIAN_MCP_TOKEN_CLAUDE in the stack .env}
+      OBSIDIAN_MCP_TOKEN_HERMES: ${OBSIDIAN_MCP_TOKEN_HERMES:?set OBSIDIAN_MCP_TOKEN_HERMES in the stack .env}
+      # Optional: an identity whose token is empty is disabled, not an error.
+      OBSIDIAN_MCP_TOKEN_PI: ${OBSIDIAN_MCP_TOKEN_PI:-}
+      # Host header allowlist (DNS-rebinding protection; "*" = any port).
+      # Keep 127.0.0.1:* for the image's own HEALTHCHECK.
+      OBSIDIAN_MCP_ALLOWED_HOSTS: "obsidian-mcp-lite,obsidian-mcp-lite:*,localhost,localhost:*,127.0.0.1,127.0.0.1:*"
+      # delete_file (moves notes to .trash/) stays off unless set to 1.
+      OBSIDIAN_MCP_ENABLE_DELETE: ${OBSIDIAN_MCP_ENABLE_DELETE:-0}
+      TZ: America/Phoenix
+    volumes:
+      - /mnt/tank3/apps/obsidian/vault:/vault
+      - /mnt/tank3/apps/obsidian-mcp/config:/config:ro
+      - /mnt/tank3/apps/obsidian-mcp/data:/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    networks:
+      - mcp_backend
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+    security_opt:
+      - no-new-privileges:true
+
+networks:
+  mcp_backend:
+    external: true
+    name: mcp_backend

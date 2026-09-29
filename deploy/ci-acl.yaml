@@ -1,0 +1,10 @@
+# ACL used by CI's container smoke test (scripts/smoke.py). Not for production.
+identities:
+  writer:
+    token_env: SMOKE_WRITER_TOKEN
+    read:  ["/"]
+    write: ["AI/Smoke/"]
+    deny:  ["Private/"]
+  reader:
+    token_env: SMOKE_READER_TOKEN
+    read:  ["Projects/"]
