@@ -6,13 +6,18 @@ Rule syntax (paths are relative to the vault root):
 * ``"AI/Claude/"`` (trailing slash) matches that folder and everything under it.
 * ``"Inbox.md"`` (no trailing slash) matches exactly that one path.
 
+Deny rules (``always_deny``, ``deny``) always cover the path *and everything
+under it*, with or without the trailing slash: ``deny: ["Secrets"]`` must not
+leave ``Secrets/key.md`` readable.
+
 Precedence: ``always_deny`` > ``deny`` > ``write`` > ``read``; write implies
 read. Any path segment starting with ``.`` is always denied.
 
-Allow rules match case-sensitively. Deny rules (``always_deny``, ``deny``)
-match case-insensitively and after Unicode NFC normalisation, so a vault on a
-case-insensitive dataset, or a note name typed with decomposed accents, cannot
-be used to slip past a deny rule.
+Allow rules match case-sensitively (after NFC). Deny rules match on a
+"skeleton" (see ``_skeleton``): case-folded, accents and compatibility forms
+stripped, Turkish dotted/dotless i folded to ``i``. That over-matches on
+purpose, so a case-insensitive dataset (common on TrueNAS SMB shares) or a
+look-alike spelling can't be used to slip past a deny rule.
 """
 
 from __future__ import annotations
@@ -42,6 +47,13 @@ def _nfc(text: str) -> str:
     return unicodedata.normalize("NFC", text)
 
 
+def _skeleton(text: str) -> str:
+    """Aggressive fold for deny matching: 'PRİVATE', 'Prıvate', 'Pri\u0301vate' -> 'private'."""
+    t = unicodedata.normalize("NFKD", text.replace("\u0131", "i").casefold())
+    t = "".join(c for c in t if not unicodedata.combining(c))
+    return unicodedata.normalize("NFKC", t).casefold()
+
+
 @dataclass(frozen=True)
 class Rule:
     """One normalised rule. ``path == ""`` with ``folder`` set is the vault root."""
@@ -50,7 +62,7 @@ class Rule:
     folder: bool
 
     @staticmethod
-    def parse(raw: Any, *, casefold: bool) -> Rule:
+    def parse(raw: Any, *, deny: bool) -> Rule:
         if not isinstance(raw, str) or not raw.strip():
             raise AclError(f"rule must be a non-empty string, got {raw!r}")
         text = _nfc(raw.strip().replace("\\", "/"))
@@ -59,8 +71,9 @@ class Rule:
         if any(p == ".." for p in parts):
             raise AclError(f"rule {raw!r} must not contain '..'")
         path = "/".join(parts)
-        if casefold:
-            path = path.casefold()
+        if deny:
+            # Deny rules always cover the subtree and match on the skeleton.
+            return Rule(path=_skeleton(path), folder=True)
         # "/" (and "") is the root, which is always a folder rule.
         return Rule(path=path, folder=folder or path == "")
 
@@ -103,7 +116,7 @@ class Acl:
         """Whether ``path`` (normalised, vault-relative) is off limits entirely."""
         if any(seg.startswith(".") for seg in path.split("/") if seg):
             return True
-        folded = _nfc(path).casefold()
+        folded = _skeleton(path)
         return any(r.matches(folded) for r in self.always_deny) or any(
             r.matches(folded) for r in identity.deny
         )
@@ -152,11 +165,11 @@ class Acl:
         if unknown:
             raise AclError(f"unknown top-level keys: {sorted(unknown)}")
         always_deny = tuple(
-            Rule.parse(r, casefold=True) for r in _rule_list(data.get("always_deny"), "always_deny")
+            Rule.parse(r, deny=True) for r in _rule_list(data.get("always_deny"), "always_deny")
         )
         # The built-in denials hold even if the file forgets them.
         for builtin in (".obsidian/", ".trash/", ".git/"):
-            rule = Rule.parse(builtin, casefold=True)
+            rule = Rule.parse(builtin, deny=True)
             if rule not in always_deny:
                 always_deny += (rule,)
 
@@ -195,16 +208,14 @@ class Acl:
                 name=name,
                 token=token,
                 read=tuple(
-                    Rule.parse(r, casefold=False)
-                    for r in _rule_list(spec.get("read"), f"{name}.read")
+                    Rule.parse(r, deny=False) for r in _rule_list(spec.get("read"), f"{name}.read")
                 ),
                 write=tuple(
-                    Rule.parse(r, casefold=False)
+                    Rule.parse(r, deny=False)
                     for r in _rule_list(spec.get("write"), f"{name}.write")
                 ),
                 deny=tuple(
-                    Rule.parse(r, casefold=True)
-                    for r in _rule_list(spec.get("deny"), f"{name}.deny")
+                    Rule.parse(r, deny=True) for r in _rule_list(spec.get("deny"), f"{name}.deny")
                 ),
             )
         if not identities:

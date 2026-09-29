@@ -13,6 +13,7 @@ classifiers = [
 dependencies = [
     "mcp>=2.2,<3",
     "pyyaml>=6.0,<7",
+    "regex>=2024.11",
     "uvicorn>=0.30",
 ]
 

@@ -48,37 +48,43 @@ Errors are prefixed with a stable code an LLM can act on, for example
 ## Permissions (`acl.yaml`)
 
 ```yaml
-# /config/acl.yaml
-always_deny: [".obsidian/", ".trash/", ".git/"]   # plus any dotfile/dotdir at any depth
+# /config/acl.yaml: the deployed ACL (decided by admin, 2026-09-29)
+always_deny: [".obsidian/", ".trash/", ".git/", "Private/"]   # every identity, incl. future ones
 identities:
-  claude:
-    token_env: OBSIDIAN_MCP_TOKEN_CLAUDE
+  claude-rc:
+    token_env: OBSIDIAN_MCP_TOKEN_CLAUDE_RC
     read:  ["/"]                  # "/" = whole vault
-    write: ["AI/Claude/", "Inbox/"]   # trailing slash = folder + everything under it
+    write: ["LLM_Data/"]          # trailing slash = folder + everything under it
     deny:  ["Private/"]
   hermes:
     token_env: OBSIDIAN_MCP_TOKEN_HERMES
     read:  ["/"]
-    write: ["AI/Hermes/", "Daily/"]
-    deny:  ["Private/", "Finance/"]
+    write: ["LLM_Data/"]
+    deny:  ["Private/"]
 ```
 
 See [`deploy/acl.example.yaml`](deploy/acl.example.yaml) for a commented version.
 
-- **Rules**: `"/"` means the whole vault. `"Folder/"` means that folder and everything under it.
-  `"Note.md"` (no trailing slash) means exactly that path. `"Private/"` does *not* match
-  `PrivateNotes/`.
+- **Vault-wide denials go in `always_deny`.** It applies to every identity, including any you
+  add later (say, a new DeepSeek worker), so nobody has to remember a per-identity `deny` for
+  `Private/`.
+- **Allow rules** (`read`, `write`): `"/"` means the whole vault. `"Folder/"` means that folder
+  and everything under it. `"Note.md"` (no trailing slash) means exactly that path. `"LLM_Data/"`
+  does *not* match `LLM_Data_old/`.
+- **Deny rules** (`always_deny`, `deny`) always cover the path *and everything under it*, with
+  or without a trailing slash.
 - **Precedence**: `always_deny` > `deny` > `write` > `read`. Write implies read.
 - Any path segment starting with `.` is always denied. `.obsidian/`, `.trash/` and `.git/` are
   denied even if the file leaves them out.
-- **Deny rules match case-insensitively and after Unicode NFC normalisation**, so a
-  case-insensitive dataset or a decomposed accent can't bypass them. Allow rules are
-  case-sensitive.
+- **Deny rules match on a folded "skeleton"**: case, accents, full-width letters and the Turkish
+  dotted/dotless i are all folded away. `Private/` also blocks `PRIVATE/`, `Prıvate/` and
+  `Ｐｒｉｖａｔｅ/`, which matters on a case-insensitive dataset. Allow rules are case-sensitive.
 - An agent with read access only below some folder can still list the folders that lead there,
   and sees nothing else in them.
 - **Tokens never go in this file.** `token_env` names the environment variable that holds the
   token. Tokens must be at least 32 characters and unique. An identity whose variable is empty is
-  disabled and logged at startup, so you can list an agent before issuing its token.
+  disabled and logged at startup. When you add an identity, add its variable to the compose
+  `environment:` block too.
 - **Reload**: file changes are picked up within about a second, or immediately after `SIGHUP`
   (`docker kill -s HUP obsidian-mcp-lite`). If the new file is invalid, the error is logged and
   the last good ACL stays in force.
@@ -96,8 +102,13 @@ See [`deploy/acl.example.yaml`](deploy/acl.example.yaml) for a commented version
   and then renamed over the target. Existing file modes are kept. New files are `0644` and new
   folders `0755`.
 - **Concurrency**: `edit_file`, `append_file` and the other write tools hold a per-file lock
-  (`/data/locks/`) for the whole read-modify-write. They also re-check the file just before the
+  for the whole read-modify-write. Locks live in `/data/locks/` as a fixed set of 256 bucket
+  files, so they can't pile up. They also re-check the file just before the
   rename, so a sync client that writes in the meantime causes a `conflict`, not a lost edit.
+- **Search**: user regexes never run on Python's `re`. Filenames and the fallback content
+  search use the `regex` module, which has a timeout and releases the interpreter lock, and
+  ripgrep's engine runs in linear time. Every search has a 30-second budget, so a pathological
+  pattern returns partial results marked `TIMED OUT` instead of freezing the server.
 - **Limits**: only `.md .txt .canvas .base .json` files can be written. Reads and writes are
   capped at 5 MiB by default.
 - **Audit**: every successful change appends one JSON line to `/data/audit.jsonl`
@@ -113,9 +124,9 @@ it is.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `OBSIDIAN_MCP_TOKEN_*` | — | One per identity; names come from `token_env` in `acl.yaml`. 32+ characters. |
+| `OBSIDIAN_MCP_TOKEN_*` | — | One per identity; names come from `token_env` in `acl.yaml` (deployed: `OBSIDIAN_MCP_TOKEN_CLAUDE_RC`, `OBSIDIAN_MCP_TOKEN_HERMES`). 32+ characters. |
 | `OBSIDIAN_MCP_ALLOWED_HOSTS` | `obsidian-mcp-lite,obsidian-mcp-lite:*,localhost,localhost:*,127.0.0.1,127.0.0.1:*` | Comma-separated Host header allowlist; `name:*` = any port. Keep `127.0.0.1:*` for the image's HEALTHCHECK. |
-| `OBSIDIAN_MCP_ENABLE_DELETE` | `0` | `1` registers `delete_file` (moves notes to `.trash/`). |
+| `OBSIDIAN_MCP_ENABLE_DELETE` | unset (off) | `1` registers `delete_file` (moves notes to `.trash/`). Off in the deployment. |
 | `OBSIDIAN_MCP_VAULT_DIR` | `/vault` | Vault root. |
 | `OBSIDIAN_MCP_ACL_FILE` | `/config/acl.yaml` | ACL file. |
 | `OBSIDIAN_MCP_DATA_DIR` | `/data` | Audit log and lock files. Must not be inside the vault. |
@@ -132,9 +143,12 @@ it is.
   `/mnt/tank3/apps/obsidian/vault:/vault`, `…/obsidian-mcp/config:/config:ro` and
   `…/obsidian-mcp/data:/data`.
 - Stack `.env`: [`deploy/.env.example`](deploy/.env.example).
-- Smoke test from the TrueNAS shell: [`deploy/smoke-truenas.sh`](deploy/smoke-truenas.sh). It runs
-  `initialize`, `tools/list`, a denied read and an allowed write, using `curlimages/curl` inside
-  `mcp_backend`.
+- Smoke test from the TrueNAS shell: `sh deploy/smoke-truenas.sh`
+  ([source](deploy/smoke-truenas.sh)). It uses `curlimages/curl` inside `mcp_backend` and reads
+  the tokens from the running container. For each identity it runs `initialize` and
+  `tools/list`, checks that `read_file Private/README.md` is refused and that `list_dir /` and
+  `search` don't reveal `Private`, then makes one allowed write into `LLM_Data/`. It prints
+  PASS/FAIL per check and exits non-zero on any failure.
 
 ## Development
 

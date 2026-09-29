@@ -4,17 +4,25 @@ Content search uses ripgrep when it is on PATH (it is in the Docker image) and
 falls back to a pure-Python scan otherwise. Either way every hit is checked
 with ``Acl.can_read`` before it is returned, so a denied note's name or text
 never appears in results. Hidden files and folders are never searched.
+
+User regexes never run on Python's ``re``: a catastrophic pattern would hold
+the GIL and freeze every other request. Filename and fallback content
+matching use the ``regex`` module with a deadline and ``concurrent=True``
+(releases the GIL); ripgrep's engine is linear-time and runs under the same
+deadline.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import re
 import shutil
 import subprocess
+import threading
 import time
 from typing import Any
+
+import regex as regex_lib
 
 from .acl import Acl, Identity
 from .errors import VaultError
@@ -51,9 +59,12 @@ def search(
         raise VaultError("invalid_argument", f"query is longer than {MAX_QUERY_LENGTH} characters")
     limit = max(1, min(int(max_results), MAX_RESULTS_CAP))
     try:
-        pattern = re.compile(query if regex else re.escape(query), re.IGNORECASE)
-    except re.error as exc:
+        pattern = regex_lib.compile(
+            query if regex else regex_lib.escape(query), regex_lib.IGNORECASE
+        )
+    except regex_lib.error as exc:
         raise VaultError("invalid_argument", f"invalid regex: {exc}") from None
+    deadline = time.monotonic() + TIMEOUT_SECONDS
 
     r = vault.resolve(identity, acl, path or "", "traverse")
     if not os.path.isdir(r.real):
@@ -62,9 +73,14 @@ def search(
     # Filename matches first: cheap, and often what the agent actually wants.
     files = list(vault.iter_entries(identity, acl, r.rel, r.real, recursive=True))
     filename_matches = []
+    timed_out = False
     for entry in files:
-        if pattern.search(entry["path"]):
-            filename_matches.append({"path": entry["path"], "type": entry["type"]})
+        try:
+            if _match(pattern, entry["path"], deadline):
+                filename_matches.append({"path": entry["path"], "type": entry["type"]})
+        except TimeoutError:
+            timed_out = True
+            break
     truncated = len(filename_matches) > limit
     filename_matches = filename_matches[:limit]
     budget = limit - len(filename_matches)
@@ -73,14 +89,16 @@ def search(
     if use_ripgrep and rg is None:
         raise RuntimeError("ripgrep requested but not installed")
     content_matches: list[dict[str, Any]] = []
-    if budget > 0:
+    if budget > 0 and not timed_out:
         if rg:
-            content_matches, more = _search_rg(
-                rg, vault, identity, acl, r.real, query, regex, budget
+            content_matches, more, timed_out = _search_rg(
+                rg, vault, identity, acl, r.real, query, regex, budget, deadline
             )
             engine = "ripgrep"
         else:
-            content_matches, more = _search_python(vault, files, pattern, budget)
+            content_matches, more, timed_out = _search_python(
+                vault, files, pattern, budget, deadline
+            )
             engine = "python"
         truncated = truncated or more
     else:
@@ -94,15 +112,32 @@ def search(
         "filename_matches": filename_matches,
         "content_matches": content_matches,
     }
-    if truncated:
+    if timed_out:
+        result["truncated"] = True
+        result["note"] = (
+            f"TIMED OUT after {TIMEOUT_SECONDS:.0f}s; results are partial. Use a simpler "
+            "query (avoid nested repetition like '(a+)+') or a narrower path."
+        )
+    elif truncated:
         result["truncated"] = True
         result["note"] = f"TRUNCATED at max_results={limit}. Narrow the query or path to see more."
     return result
 
 
+def _match(pattern: regex_lib.Pattern[str], text: str, deadline: float) -> bool:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError
+    return pattern.search(text, timeout=remaining, concurrent=True) is not None
+
+
 def _search_python(
-    vault: Vault, files: list[dict[str, Any]], pattern: re.Pattern[str], budget: int
-) -> tuple[list[dict[str, Any]], bool]:
+    vault: Vault,
+    files: list[dict[str, Any]],
+    pattern: regex_lib.Pattern[str],
+    budget: int,
+    deadline: float,
+) -> tuple[list[dict[str, Any]], bool, bool]:
     hits: list[dict[str, Any]] = []
     for entry in files:
         if entry["type"] != "file":
@@ -112,21 +147,26 @@ def _search_python(
         if entry["size"] > vault.max_read_bytes:
             continue
         try:
-            with open(entry["_real"], "rb") as fh:
+            fd = os.open(entry["_real"], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(fd, "rb") as fh:
                 data = fh.read(vault.max_read_bytes + 1)
             text = data.decode("utf-8")
         except (OSError, UnicodeDecodeError):
             continue
         per_file = 0
         for number, line in enumerate(text.split("\n"), start=1):
-            if pattern.search(line):
+            try:
+                found = _match(pattern, line, deadline)
+            except TimeoutError:
+                return hits, True, True
+            if found:
                 if len(hits) >= budget:
-                    return hits, True
+                    return hits, True, False
                 hits.append({"path": entry["path"], "line": number, "text": _snippet(line)})
                 per_file += 1
                 if per_file >= PER_FILE_HITS:
                     break
-    return hits, False
+    return hits, False, False
 
 
 def _search_rg(
@@ -138,7 +178,8 @@ def _search_rg(
     query: str,
     regex: bool,
     budget: int,
-) -> tuple[list[dict[str, Any]], bool]:
+    deadline: float,
+) -> tuple[list[dict[str, Any]], bool, bool]:
     cmd = [
         rg,
         "--json",
@@ -163,16 +204,15 @@ def _search_rg(
 
     hits: list[dict[str, Any]] = []
     more = False
-    deadline = time.monotonic() + TIMEOUT_SECONDS
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL
     )
+    # Kill rg at the deadline even if it is scanning silently and never yields a line.
+    watchdog = threading.Timer(max(0.0, deadline - time.monotonic()), proc.kill)
+    watchdog.start()
     try:
         assert proc.stdout is not None
         for raw in proc.stdout:
-            if time.monotonic() > deadline:
-                more = True
-                break
             try:
                 msg = json.loads(raw)
             except ValueError:
@@ -196,7 +236,9 @@ def _search_rg(
                 break
             hits.append({"path": rel, "line": data.get("line_number"), "text": _snippet(text)})
     finally:
+        watchdog.cancel()
         if proc.poll() is None:
             proc.kill()
         proc.wait()
-    return hits, more
+    timed_out = not more and time.monotonic() >= deadline
+    return hits, more or timed_out, timed_out

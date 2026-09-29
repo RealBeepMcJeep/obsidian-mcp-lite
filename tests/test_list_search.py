@@ -128,3 +128,55 @@ def test_search_rejects_bad_input_and_denied_scope(vault, acl, claude):
     with pytest.raises(VaultError) as err:
         search(vault, claude, acl, "swordfish", path="Private")
     assert err.value.code == "path_forbidden"
+
+
+@pytest.mark.parametrize("use_rg", ENGINES)
+def test_deny_rule_without_slash_hides_folder_everywhere(layout, vault, claude, use_rg):
+    from obsidian_mcp_lite.acl import Acl
+
+    (layout["vault"] / "Secrets").mkdir()
+    (layout["vault"] / "Secrets/key.md").write_text("swordfish-key\n")
+    acl = Acl.from_mapping(
+        {"identities": {"a": {"token_env": "T", "read": ["/"], "deny": ["Secrets"]}}},
+        {"T": "t" * 40},
+    )
+    a = acl.identities["a"]
+    with pytest.raises(VaultError):
+        vault.read_file(a, acl, "Secrets/key.md")
+    listed = vault.list_dir(a, acl, "/", recursive=True, max_entries=5000)
+    assert not any("Secrets" in p for p in _paths(listed))
+    res = search(vault, a, acl, "swordfish-key", use_ripgrep=use_rg)
+    assert res["content_matches"] == [] and "Secrets" not in json.dumps(res)
+
+
+@pytest.mark.parametrize("use_rg", ENGINES)
+def test_catastrophic_regex_times_out_without_freezing(
+    layout, vault, acl, reader, use_rg, monkeypatch
+):
+    import threading
+    import time
+
+    import obsidian_mcp_lite.search as search_mod
+
+    monkeypatch.setattr(search_mod, "TIMEOUT_SECONDS", 1.0)
+    (layout["vault"] / "Projects" / ("a" * 60 + ".md")).write_text("a" * 60 + "!\n")
+    ticks = []
+    stop = threading.Event()
+
+    def background():
+        while not stop.is_set():
+            ticks.append(1)
+            time.sleep(0.01)
+
+    t = threading.Thread(target=background)
+    t.start()
+    start = time.monotonic()
+    try:
+        res = search(vault, reader, acl, "(a|aa)+$", regex=True, use_ripgrep=use_rg)
+    finally:
+        stop.set()
+        t.join()
+    elapsed = time.monotonic() - start
+    assert elapsed < 5
+    assert res["truncated"] is True and "TIMED OUT" in res["note"]
+    assert len(ticks) > 20  # other threads kept running: the GIL was released

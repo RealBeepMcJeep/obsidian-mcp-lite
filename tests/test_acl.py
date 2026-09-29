@@ -176,12 +176,48 @@ def test_shipped_example_acls_load():
     root = __import__("pathlib").Path(__file__).resolve().parent.parent / "deploy"
     example = Acl.load(
         root / "acl.example.yaml",
-        {"OBSIDIAN_MCP_TOKEN_CLAUDE": "c" * 40, "OBSIDIAN_MCP_TOKEN_HERMES": "h" * 40},
+        {"OBSIDIAN_MCP_TOKEN_CLAUDE_RC": "c" * 40, "OBSIDIAN_MCP_TOKEN_HERMES": "h" * 40},
     )
-    assert set(example.identities) == {"claude", "hermes"}  # pi disabled: no token
-    claude = example.identities["claude"]
-    assert example.can_write(claude, "Inbox/x.md") and not example.can_read(claude, "Private/x")
+    assert set(example.identities) == {"claude-rc", "hermes"}
+    for ident in example.identities.values():
+        assert example.can_write(ident, "LLM_Data/notes/x.md")
+        assert example.can_read(ident, "Notion/page.md") and example.can_read(ident, "Home.md")
+        assert not example.can_write(ident, "prompts/p.md")
+        assert not example.can_read(ident, "Private/README.md")
+        assert not example.can_traverse(ident, "Private")
+    # Private/ is in always_deny, so an identity added later is covered without its own deny.
+    later = Acl.from_mapping(
+        {
+            "always_deny": [r.path + "/" for r in example.always_deny],
+            "identities": {"deepseek": {"token_env": "T", "read": ["/"], "write": ["/"]}},
+        },
+        {"T": "d" * 40},
+    )
+    ds = later.identities["deepseek"]
+    assert not later.can_read(ds, "Private/README.md") and not later.can_write(ds, "private/x.md")
     ci = Acl.load(
         root / "ci-acl.yaml", {"SMOKE_WRITER_TOKEN": "w" * 40, "SMOKE_READER_TOKEN": "r" * 40}
     )
     assert not ci.identities["reader"].can_write_anything
+
+
+def test_deny_without_trailing_slash_covers_subtree():
+    acl = Acl.from_mapping(
+        {"identities": {"a": {"token_env": "T", "read": ["/"], "deny": ["Secrets", "Diary.md"]}}},
+        {"T": "t" * 40},
+    )
+    a = acl.identities["a"]
+    assert not acl.can_read(a, "Secrets")
+    assert not acl.can_read(a, "Secrets/key.md")
+    assert not acl.can_read(a, "secrets/deep/key.md")
+    assert not acl.can_read(a, "Diary.md")
+    assert acl.can_read(a, "SecretsOfTheSea.md")
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    ["Prıvate", "PRİVATE", "prİvate", "Prívate", "Ｐｒｉｖａｔｅ", "PRIVATE"],
+)
+def test_deny_resists_lookalike_spellings(acl, claude, spelling):
+    # On a case-insensitive dataset these may all open the real Private/ folder.
+    assert not acl.can_read(claude, f"{spelling}/secret-diary.md")

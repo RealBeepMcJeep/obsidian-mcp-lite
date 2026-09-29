@@ -93,6 +93,7 @@ def test_host_allowed_patterns():
     assert not host_allowed("127.0.0.1:9000", allowed)
     assert not host_allowed("obsidian-mcp-lite:", allowed)
     assert not host_allowed("obsidian-mcp-lite:8000@evil", allowed)
+    assert not host_allowed("obsidian-mcp-lite:\u00b2", allowed)  # unicode digit
 
 
 def test_initialize_and_tools_list_per_identity(http):

@@ -332,3 +332,26 @@ def test_every_mutation_is_audited(layout, acl, claude):
 def test_data_dir_inside_vault_is_rejected(layout):
     with pytest.raises(ValueError, match="must not be inside the vault"):
         Vault(layout["vault"], layout["vault"] / "state")
+
+
+def test_lock_files_are_bounded(layout, vault, acl, claude):
+    for i in range(400):
+        with pytest.raises(VaultError):
+            vault.edit_file(claude, acl, f"Inbox/missing-{i}.md", "a", "b")
+    assert len(os.listdir(layout["data"] / "locks")) <= 256
+
+
+def test_fifo_does_not_hang_reads_or_stat(layout, vault, acl, claude):
+    os.mkfifo(layout["vault"] / "Inbox" / "pipe.md")
+    with pytest.raises(VaultError) as err:
+        vault.read_file(claude, acl, "Inbox/pipe.md")
+    assert err.value.code == "not_a_file"
+    assert "revision" not in vault.stat(claude, acl, "Inbox/pipe.md")
+    names = {e["path"] for e in vault.list_dir(claude, acl, "Inbox")["entries"]}
+    assert "Inbox/pipe.md" not in names
+
+
+def test_stat_skips_hash_for_oversized_files(layout, vault, acl, claude):
+    (layout["vault"] / "Inbox/huge.md").write_bytes(b"x" * (vault.max_read_bytes + 10))
+    out = vault.stat(claude, acl, "Inbox/huge.md")
+    assert "revision" not in out and "no revision" in out["note"]

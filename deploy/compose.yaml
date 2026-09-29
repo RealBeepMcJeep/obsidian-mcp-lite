@@ -25,15 +25,13 @@ services:
     init: true
     user: "568:568"
     environment:
-      OBSIDIAN_MCP_TOKEN_CLAUDE: ${OBSIDIAN_MCP_TOKEN_CLAUDE:?set OBSIDIAN_MCP_TOKEN_CLAUDE in the stack .env}
+      # One per identity in acl.yaml (token_env). Add a line here for each new identity.
+      OBSIDIAN_MCP_TOKEN_CLAUDE_RC: ${OBSIDIAN_MCP_TOKEN_CLAUDE_RC:?set OBSIDIAN_MCP_TOKEN_CLAUDE_RC in the stack .env}
       OBSIDIAN_MCP_TOKEN_HERMES: ${OBSIDIAN_MCP_TOKEN_HERMES:?set OBSIDIAN_MCP_TOKEN_HERMES in the stack .env}
-      # Optional: an identity whose token is empty is disabled, not an error.
-      OBSIDIAN_MCP_TOKEN_PI: ${OBSIDIAN_MCP_TOKEN_PI:-}
       # Host header allowlist (DNS-rebinding protection; "*" = any port).
       # Keep 127.0.0.1:* for the image's own HEALTHCHECK.
       OBSIDIAN_MCP_ALLOWED_HOSTS: "obsidian-mcp-lite,obsidian-mcp-lite:*,localhost,localhost:*,127.0.0.1,127.0.0.1:*"
-      # delete_file (moves notes to .trash/) stays off unless set to 1.
-      OBSIDIAN_MCP_ENABLE_DELETE: ${OBSIDIAN_MCP_ENABLE_DELETE:-0}
+      # delete_file is off: OBSIDIAN_MCP_ENABLE_DELETE is deliberately not set.
       TZ: America/Phoenix
     volumes:
       - /mnt/tank3/apps/obsidian/vault:/vault

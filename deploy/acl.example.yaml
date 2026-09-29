@@ -1,12 +1,17 @@
 # /mnt/tank3/apps/obsidian-mcp/config/acl.yaml  (mounted read-only at /config/acl.yaml)
+# This is the ACL admin decided on 2026-09-29 (ai-goes-fast/agents#2).
 #
 # Rules are vault-relative paths:
 #   "/"            the whole vault
-#   "AI/Claude/"   that folder and everything under it (trailing slash)
-#   "Home.md"      exactly that one path (no trailing slash)
+#   "LLM_Data/"    that folder and everything under it (trailing slash)
+#   "Home.md"      exactly that one path (allow rules only; see below)
 # Precedence: always_deny > deny > write > read. write implies read.
+# Deny rules (always_deny and deny) always cover the path AND everything under
+# it, and match case-insensitively (also against look-alike spellings).
 # Any dotfile/dotfolder (".obsidian", ".trash", ".git", ".foo.md") is always denied.
-# Deny rules match case-insensitively; allow rules are case-sensitive.
+#
+# always_deny applies to EVERY identity, including ones added later. Put
+# vault-wide secrets like Private/ here, so a new identity can't forget them.
 #
 # Tokens are NOT stored here: token_env names the env var that holds the
 # identity's bearer token (32+ characters, unique per identity). An identity
@@ -15,23 +20,17 @@
 # Changes are picked up within about a second, or immediately on SIGHUP. A
 # broken file is logged and ignored; the last good ACL stays in force.
 
-always_deny: [".obsidian/", ".trash/", ".git/"]
+always_deny: [".obsidian/", ".trash/", ".git/", "Private/"]
 
 identities:
-  claude:
-    token_env: OBSIDIAN_MCP_TOKEN_CLAUDE
+  claude-rc:
+    token_env: OBSIDIAN_MCP_TOKEN_CLAUDE_RC
     read:  ["/"]
-    write: ["AI/Claude/", "Inbox/"]
+    write: ["LLM_Data/"]
     deny:  ["Private/"]
 
   hermes:
     token_env: OBSIDIAN_MCP_TOKEN_HERMES
     read:  ["/"]
-    write: ["AI/Hermes/", "Daily/"]
-    deny:  ["Private/", "Finance/"]
-
-  pi:
-    token_env: OBSIDIAN_MCP_TOKEN_PI
-    read:  ["/"]
-    write: ["AI/Pi/"]
-    deny:  ["Private/", "Finance/"]
+    write: ["LLM_Data/"]
+    deny:  ["Private/"]

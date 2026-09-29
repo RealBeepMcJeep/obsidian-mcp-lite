@@ -45,6 +45,7 @@ FILE_MODE = 0o644
 DIR_MODE = 0o755
 DEFAULT_READ_LIMIT = 2000
 MAX_LIST_ENTRIES = 5000
+LOCK_BUCKETS = 256
 WIKILINK_NOTE = "Links are not rewritten: [[wikilinks]] that point at the old path now dangle."
 
 
@@ -169,7 +170,8 @@ class Vault:
         self, real: str, rel: str, *, limit: int | None = None
     ) -> tuple[bytes, os.stat_result]:
         try:
-            fd = os.open(real, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            # O_NONBLOCK: a FIFO in the vault must not hang the request.
+            fd = os.open(real, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
         except FileNotFoundError:
             raise VaultError("not_found", f"'{rel}' does not exist") from None
         except OSError as exc:
@@ -282,11 +284,18 @@ class Vault:
 
     @contextmanager
     def _locked(self, *resolved: Resolved) -> Iterator[None]:
-        # Sorted, de-duplicated keys: two movers can never deadlock each other.
-        keys = sorted({hashlib.sha256(r.real_rel.encode()).hexdigest() for r in resolved})
+        # A fixed set of lock files (paths hash into buckets), so an agent can't fill
+        # /data with one lock file per path it invents. Sorted, de-duplicated
+        # buckets: two movers can never deadlock each other.
+        keys = sorted(
+            {
+                int(hashlib.sha256(r.real_rel.encode()).hexdigest(), 16) % LOCK_BUCKETS
+                for r in resolved
+            }
+        )
         with ExitStack() as stack:
             for key in keys:
-                fh = stack.enter_context(open(self.lock_dir / f"{key}.lock", "a+b"))
+                fh = stack.enter_context(open(self.lock_dir / f"{key:03d}.lock", "a+b"))
                 fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
             yield
 
@@ -363,12 +372,12 @@ class Vault:
             "size": st.st_size,
             "mtime": _iso(st.st_mtime),
         }
-        if stat_mod.S_ISREG(st.st_mode):
-            h = hashlib.sha256()
-            with open(r.real, "rb") as fh:
-                for block in iter(lambda: fh.read(1 << 20), b""):
-                    h.update(block)
-            out["revision"] = h.hexdigest()
+        cap = max(self.max_read_bytes, self.max_write_bytes)
+        if stat_mod.S_ISREG(st.st_mode) and st.st_size <= cap:
+            data, _ = self._read_bytes(r.real, r.rel, limit=cap)
+            out["revision"] = revision_of(data)
+        elif stat_mod.S_ISREG(st.st_mode):
+            out["note"] = f"larger than {cap} bytes; no revision computed"
         return out
 
     def iter_entries(

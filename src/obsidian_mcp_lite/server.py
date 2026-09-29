@@ -54,7 +54,11 @@ def host_allowed(host: str, allowed: tuple[str, ...]) -> bool:
     for pattern in (a.lower() for a in allowed):
         if pattern.endswith(":*"):
             base = pattern[:-2]
-            if host == base or (host.startswith(base + ":") and host[len(base) + 1 :].isdigit()):
+            if host == base or (
+                host.startswith(base + ":")
+                and host[len(base) + 1 :].isascii()
+                and host[len(base) + 1 :].isdigit()
+            ):
                 return True
         elif host == pattern:
             return True
