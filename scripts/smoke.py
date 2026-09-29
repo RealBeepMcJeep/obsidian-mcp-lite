@@ -59,7 +59,8 @@ def smoke(base: str, writer: str, reader: str) -> None:
             status, _ = request(f"{base}/healthz", method="GET")
             if status == 200:
                 break
-        except urllib.error.URLError:
+        except (urllib.error.URLError, ConnectionError, OSError):
+            # docker-proxy accepts and then resets connections until the app listens.
             pass
         time.sleep(1)
     else:
